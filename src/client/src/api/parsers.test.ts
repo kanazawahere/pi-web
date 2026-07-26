@@ -1,8 +1,60 @@
 import { describe, expect, it } from "vitest";
 import { PI_WEB_CAPABILITIES } from "../../../shared/capabilities";
-import { parseCommandResult, parseFileContentResponse, parseFileSuggestion, parseGitStatusResponse, parseMachineRuntime, parseMessagePage, parsePiPackageMutationResponse, parsePiPackagesResponse, parsePiWebConfigResponse, parsePiWebPluginsResponse, parseSecureInputReceipt, parseSecureInputStatusResponse, parsePiWebRuntimeResponse, parsePiWebStatusResponse, parseSessionBulkArchiveResponse, parseSessionBulkDeleteArchivedResponse, parseSessionCleanupExecuteResponse, parseSessionCleanupPreviewResponse, parseSessionInfo, parseSessionStatus, parseSlashCommand, parseTerminalCommandRun, parseTerminalInfo, parseWorkspace, parseWorkspaceActivityResponse } from "./parsers";
+import { SESSION_NOTIFICATION_LIMIT, SESSION_NOTIFICATION_MESSAGE_BYTES, SESSION_UNREAD_CATALOG_ID_MAX_LENGTH } from "../../../shared/apiTypes";
+import { parseAuthProvidersResponse, parseCommandResult, parseFileContentResponse, parseFileSuggestion, parseGitStatusResponse, parseMachineRuntime, parseMessagePage, parseOAuthFlowState, parsePiPackageMutationResponse, parsePiPackagesResponse, parsePiWebConfigResponse, parsePiWebPluginsResponse, parsePiWebRuntimeResponse, parsePiWebStatusResponse, parseSecureInputReceipt, parseSecureInputStatusResponse, parseSessionBulkArchiveResponse, parseSessionBulkDeleteArchivedResponse, parseSessionCleanupExecuteResponse, parseSessionCleanupPreviewResponse, parseSessionInfo, parseSessionNotificationInboxEvent, parseSessionNotificationInboxSnapshot, parseSessionStartupProgressEvent, parseSessionStatus, parseSessionStreamSnapshot, parseSessionTreeNavigateResult, parseSessionTreeSnapshot, parseSessionUnreadCatalogSnapshot, parseSessionUnreadEvent, parseSlashCommand, parseTerminalCommandRun, parseTerminalInfo, parseWorkspace, parseWorkspaceActivityResponse } from "./parsers";
 
 describe("API parsers", () => {
+  it("preserves additive interactive API-key flow hints and defaults legacy options", () => {
+    const base = { id: "openai", name: "OpenAI", authType: "api_key", status: { configured: false } };
+
+    expect(parseAuthProvidersResponse({ providers: [{ ...base, loginFlow: "interactive" }, base] }).providers).toEqual([
+      { ...base, loginFlow: "interactive" },
+      base,
+    ]);
+  });
+
+  it("preserves additive OAuth interaction semantics", () => {
+    expect(parseOAuthFlowState({
+      flowId: "flow-1",
+      providerId: "provider",
+      providerName: "Provider",
+      status: "running",
+      auth: {
+        url: "https://example.test/device",
+        instructions: "Enter code",
+        deviceCode: { userCode: "ABCD", intervalSeconds: 5, expiresInSeconds: 900 },
+      },
+      prompt: { requestId: "prompt-1", message: "Secret", kind: "prompt", promptType: "secret", allowEmpty: false, placeholder: "token" },
+      select: { requestId: "select-1", message: "Choose", options: [{ value: "work", label: "Work", description: "Company account" }] },
+      progress: ["Read the guide"],
+      info: [{ message: "Read the guide", links: [{ url: "https://example.test/docs", label: "Guide" }] }],
+    })).toMatchObject({
+      auth: { deviceCode: { userCode: "ABCD", intervalSeconds: 5, expiresInSeconds: 900 } },
+      prompt: { kind: "prompt", promptType: "secret", allowEmpty: false },
+      select: { options: [{ value: "work", description: "Company account" }] },
+      info: [{ links: [{ url: "https://example.test/docs", label: "Guide" }] }],
+    });
+  });
+
+  it("defaults semantic prompt types from legacy OAuth wire kinds", () => {
+    const flow = {
+      flowId: "flow-1",
+      providerId: "provider",
+      providerName: "Provider",
+      status: "running",
+      progress: [],
+    };
+
+    expect(parseOAuthFlowState({ ...flow, prompt: { requestId: "text", message: "Value", kind: "prompt" } }).prompt).toMatchObject({
+      kind: "prompt",
+      promptType: "text",
+    });
+    expect(parseOAuthFlowState({ ...flow, prompt: { requestId: "manual", message: "Code", kind: "manual" } }).prompt).toMatchObject({
+      kind: "manual",
+      promptType: "manual_code",
+    });
+  });
+
   it("parses PI WEB config responses", () => {
     expect(parsePiWebConfigResponse({
       path: "/tmp/config.json",
@@ -159,6 +211,121 @@ describe("API parsers", () => {
     expect(parseMessagePage({ messages: ["c"], start: 3, total: 9 })).toEqual({ messages: ["c"], start: 3, total: 9 });
   });
 
+  it("parses a session stream snapshot, defaulting a missing partial to null", () => {
+    expect(parseSessionStreamSnapshot({ seq: 7, partial: { role: "assistant", content: [{ type: "text", text: "hi" }] } })).toEqual({
+      seq: 7,
+      partial: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+    });
+    expect(parseSessionStreamSnapshot({ seq: 0, partial: null })).toEqual({ seq: 0, partial: null });
+    expect(parseSessionStreamSnapshot({ seq: 3 })).toEqual({ seq: 3, partial: null });
+  });
+
+  it("rejects a session stream snapshot without a numeric seq", () => {
+    expect(() => parseSessionStreamSnapshot({ partial: null })).toThrow("Expected number field: seq");
+  });
+
+  it("strictly parses unread snapshots and identity-matched deltas", () => {
+    const newest = { sessionId: "session-2", cwd: "/repo", completionOrder: 2, completedAt: "2026-07-20T00:00:02.000Z" };
+    const oldest = { sessionId: "session-1", cwd: "/repo", completionOrder: 1, completedAt: "2026-07-20T00:00:01.000Z" };
+    expect(parseSessionUnreadCatalogSnapshot({ catalogId: "catalog-a", catalogRevision: 2, sessions: [newest, oldest] })).toEqual({
+      catalogId: "catalog-a",
+      catalogRevision: 2,
+      sessions: [newest, oldest],
+    });
+    expect(parseSessionUnreadEvent({
+      type: "sessions.unread",
+      catalogId: "catalog-a",
+      catalogRevision: 3,
+      sessionId: newest.sessionId,
+      cwd: newest.cwd,
+      unread: newest,
+    })).toMatchObject({ type: "sessions.unread", unread: newest });
+    expect(parseSessionUnreadEvent({
+      type: "sessions.unread",
+      catalogId: "catalog-a",
+      catalogRevision: 4,
+      sessionId: newest.sessionId,
+      cwd: newest.cwd,
+      unread: null,
+    })).toMatchObject({ type: "sessions.unread", unread: null });
+  });
+
+  it("rejects malformed, duplicate, unsorted, and mismatched unread payloads", () => {
+    const summary = { sessionId: "session-1", cwd: "/repo", completionOrder: 1, completedAt: "2026-07-20T00:00:01.000Z" };
+    expect(() => parseSessionUnreadCatalogSnapshot({ catalogId: "catalog-a", catalogRevision: 2, sessions: [summary, summary] })).toThrow("Duplicate session unread identity");
+    expect(() => parseSessionUnreadCatalogSnapshot({
+      catalogId: "catalog-a",
+      catalogRevision: 2,
+      sessions: [summary, { ...summary, sessionId: "session-2", completionOrder: 2 }],
+    })).toThrow("not newest-first");
+    expect(() => parseSessionUnreadCatalogSnapshot({ catalogId: "catalog-a", catalogRevision: 1, sessions: [{ ...summary, completedAt: "never" }] })).toThrow("Invalid canonical session unread completion time");
+    expect(() => parseSessionUnreadCatalogSnapshot({ catalogId: "catalog-a", catalogRevision: 1, sessions: [{ ...summary, completedAt: "2026-07-20" }] })).toThrow("Invalid canonical session unread completion time");
+    expect(() => parseSessionUnreadCatalogSnapshot({
+      catalogId: "x".repeat(SESSION_UNREAD_CATALOG_ID_MAX_LENGTH + 1),
+      catalogRevision: 0,
+      sessions: [],
+    })).toThrow("String field exceeds limit: catalogId");
+    expect(() => parseSessionUnreadCatalogSnapshot({
+      catalogId: "catalog-a",
+      catalogRevision: 0,
+      sessions: [summary],
+    })).toThrow("completion order exceeds catalog revision");
+    expect(() => parseSessionUnreadEvent({
+      type: "sessions.unread",
+      catalogId: "catalog-a",
+      catalogRevision: 1,
+      sessionId: "session-1",
+      cwd: "/repo",
+      unread: { ...summary, completionOrder: 2 },
+    })).toThrow("completion order exceeds catalog revision");
+    expect(() => parseSessionUnreadEvent({
+      type: "sessions.unread",
+      catalogId: "catalog-a",
+      catalogRevision: 1,
+      sessionId: "other-session",
+      cwd: "/repo",
+      unread: summary,
+    })).toThrow("identity mismatch");
+    expect(() => parseSessionUnreadEvent({
+      type: "sessions.unread",
+      catalogId: "catalog-a",
+      catalogRevision: 0,
+      sessionId: "session-1",
+      cwd: "/repo",
+      unread: null,
+    })).toThrow("positive safe integer");
+  });
+
+  it("parses session startup progress with and without a wait detail", () => {
+    const activity = { sessionId: "session-1", phase: "active", label: "Creating session", detail: "Starting the Pi session", at: "2026-07-20T00:00:01.000Z" };
+
+    expect(parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity })).toEqual({
+      type: "session.startup",
+      cwd: "/repo",
+      activity,
+    });
+    const idle = { sessionId: "session-1", phase: "idle", label: "idle", at: "2026-07-20T00:00:02.000Z" };
+    expect(parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity: idle })).toEqual({
+      type: "session.startup",
+      cwd: "/repo",
+      activity: idle,
+    });
+  });
+
+  it("rejects session startup progress that cannot be routed or rendered honestly", () => {
+    const activity = { sessionId: "session-1", phase: "active", label: "Creating session", at: "2026-07-20T00:00:01.000Z" };
+
+    expect(() => parseSessionStartupProgressEvent({ type: "activity.update", cwd: "/repo", activity })).toThrow("Invalid session startup event type");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", activity })).toThrow("Expected string field: cwd");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "", activity })).toThrow("Expected non-empty string field: cwd");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo" })).toThrow("Expected object response");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity: { ...activity, phase: "waiting" } })).toThrow("Expected session activity phase field: phase");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity: { ...activity, label: 7 } })).toThrow("Expected string field: label");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity: { ...activity, label: "" } })).toThrow("Expected non-empty string field: label");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity: { ...activity, detail: 7 } })).toThrow("Expected optional string field: detail");
+    expect(() => parseSessionStartupProgressEvent({ type: "session.startup", cwd: "/repo", activity: { ...activity, sessionId: "" } })).toThrow("Expected non-empty string field: sessionId");
+  });
+
   it("parses session cleanup preview and execute responses", () => {
     const preview = {
       generatedAt: "2026-06-25T12:00:00.000Z",
@@ -262,6 +429,59 @@ describe("API parsers", () => {
     });
   });
 
+  it("parses live session warnings including optional source and path", () => {
+    const parsed = parseSessionStatus({
+      sessionId: "s1",
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      pendingMessageCount: 0,
+      queuedMessages: [],
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+      warnings: [
+        { severity: "error", message: "bad skill", source: "skill", path: "/skills/a.md" },
+        { severity: "warning", message: "subscription active", source: "anthropic", dismiss: { id: "anthropicExtraUsage" } },
+        { severity: "info", message: "heads up", source: "runtime" },
+      ],
+    });
+
+    expect(parsed.warnings).toEqual([
+      { severity: "error", message: "bad skill", source: "skill", path: "/skills/a.md" },
+      { severity: "warning", message: "subscription active", source: "anthropic", dismiss: { id: "anthropicExtraUsage" } },
+      { severity: "info", message: "heads up", source: "runtime" },
+    ]);
+  });
+
+  it("omits warnings entirely when the field is absent", () => {
+    const parsed = parseSessionStatus({
+      sessionId: "s1",
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      pendingMessageCount: 0,
+      queuedMessages: [],
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+    });
+
+    expect(parsed.warnings).toBeUndefined();
+  });
+
+  it("rejects a warning with an invalid severity", () => {
+    expect(() => parseSessionStatus({
+      sessionId: "s1",
+      isStreaming: false,
+      isCompacting: false,
+      isBashRunning: false,
+      pendingMessageCount: 0,
+      queuedMessages: [],
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+      warnings: [{ severity: "fatal", message: "nope" }],
+    })).toThrow("Invalid session warning severity");
+  });
+
   it("parses workspace effective upload config when present", () => {
     expect(parseWorkspace({
       id: "w1",
@@ -320,6 +540,28 @@ describe("API parsers", () => {
     expect(() => parseSlashCommand({ name: "bad", source: "remote" })).toThrow("Invalid command source");
     expect(() => parseFileSuggestion({ path: "a", kind: "deleted" })).toThrow("Invalid file kind");
     expect(() => parseGitStatusResponse({ isGitRepo: true, hash: "h", files: [{ path: "a", index: "weird", workingTree: "modified" }] })).toThrow("Invalid git file state");
+  });
+
+  it("parses submodule paths and pointer commit fields", () => {
+    const parsed = parseGitStatusResponse({
+      isGitRepo: true,
+      hash: "h",
+      branch: "main",
+      files: [
+        { path: "HARL", index: "unmodified", workingTree: "modified", submoduleFromCommit: "1111111", submoduleToCommit: "2222222" },
+        { path: "HARL/inner.txt", index: "modified", workingTree: "modified" },
+      ],
+      submodules: ["HARL"],
+    });
+    expect(parsed.submodules).toEqual(["HARL"]);
+    expect(parsed.files[0]?.submoduleFromCommit).toBe("1111111");
+    expect(parsed.files[0]?.submoduleToCommit).toBe("2222222");
+    expect(parsed.files[1]?.submoduleFromCommit).toBeUndefined();
+  });
+
+  it("defaults submodules to an empty list when absent", () => {
+    const parsed = parseGitStatusResponse({ isGitRepo: true, hash: "h", files: [] });
+    expect(parsed.submodules).toEqual([]);
   });
 
   it("validates file content responses", () => {
@@ -397,9 +639,141 @@ describe("API parsers", () => {
   });
 
   it("parses command result variants", () => {
+    const tree = sessionTreeWire();
     expect(parseCommandResult({ type: "unsupported", message: "nope" })).toEqual({ type: "unsupported", message: "nope" });
     expect(parseCommandResult({ type: "select", requestId: "r1", title: "Pick", options: [{ value: "v", label: "Label", description: "desc" }] })).toEqual({ type: "select", requestId: "r1", title: "Pick", options: [{ value: "v", label: "Label", description: "desc" }] });
+    expect(parseCommandResult({ type: "tree", tree })).toEqual({ type: "tree", tree });
     expect(parseCommandResult({ type: "done", message: "ok", promptDraft: "resend me" })).toEqual({ type: "done", message: "ok", promptDraft: "resend me" });
     expect(() => parseCommandResult({ type: "later" })).toThrow("Invalid command result type");
   });
+
+  it("strictly parses session tree snapshots and navigation results", () => {
+    const tree = sessionTreeWire();
+    expect(parseSessionTreeSnapshot(tree)).toEqual(tree);
+    expect(parseSessionTreeNavigateResult({ cancelled: false, editorText: "edit this" })).toEqual({ cancelled: false, editorText: "edit this" });
+    expect(parseSessionTreeNavigateResult({ cancelled: false })).toEqual({ cancelled: false });
+    expect(parseSessionTreeNavigateResult({ cancelled: true, aborted: true })).toEqual({ cancelled: true, aborted: true });
+    expect(parseSessionTreeNavigateResult({ cancelled: true })).toEqual({ cancelled: true });
+    expect(parseSessionTreeNavigateResult({ cancelled: false, editorText: "edit this", operationId: "future-metadata" })).toEqual({ cancelled: false, editorText: "edit this" });
+    expect(parseSessionTreeNavigateResult({ cancelled: true, aborted: true, operationId: "future-metadata" })).toEqual({ cancelled: true, aborted: true });
+
+    expect(() => parseSessionTreeSnapshot({ ...tree, activeLeafId: undefined })).toThrow("activeLeafId");
+    expect(() => parseSessionTreeSnapshot({ ...tree, activeLeafId: "missing" })).toThrow("activeLeafId");
+    expect(() => parseSessionTreeSnapshot({ ...tree, activeLeafId: "   " })).toThrow("activeLeafId");
+    expect(() => parseSessionTreeSnapshot({ ...tree, activePathIds: ["root", 2] })).toThrow("activePathIds");
+    expect(() => parseSessionTreeSnapshot({ ...tree, activePathIds: ["   "] })).toThrow("activePathIds");
+    expect(() => parseSessionTreeSnapshot({ ...tree, nodes: [{ ...tree.nodes[0], id: "   " }] })).toThrow("id");
+    expect(() => parseSessionTreeSnapshot({ ...tree, nodes: [{ ...tree.nodes[0], parentId: undefined }] })).toThrow("parentId");
+    expect(() => parseSessionTreeSnapshot({ ...tree, nodes: [{ ...tree.nodes[0], parentId: "   " }] })).toThrow("parentId");
+    expect(() => parseSessionTreeSnapshot({ ...tree, nodes: [tree.nodes[0], tree.nodes[0]] })).toThrow("Duplicate session tree node id");
+    expect(() => parseSessionTreeSnapshot({ ...tree, nodes: [{ ...tree.nodes[0], kind: "future-kind" }] })).toThrow("Invalid session tree node kind");
+    expect(() => parseSessionTreeNavigateResult({ cancelled: true, editorText: "wrong branch" })).toThrow("editorText");
+    expect(() => parseSessionTreeNavigateResult({ cancelled: false, aborted: true })).toThrow("aborted");
+    expect(() => parseSessionTreeNavigateResult({ cancelled: false, editorText: 42 })).toThrow("editorText");
+    expect(() => parseSessionTreeNavigateResult({ cancelled: true, aborted: "yes" })).toThrow("aborted");
+    expect(() => parseSessionTreeNavigateResult({ cancelled: false, summaryEntry: { raw: true } })).toThrow("summaryEntry");
+    expect(() => parseSessionTreeNavigateResult({ cancelled: true, summaryEntry: { raw: true } })).toThrow("summaryEntry");
+    expect(() => parseSessionTreeNavigateResult({ editorText: "missing discriminator" })).toThrow("cancelled");
+  });
+
+  it("strictly parses selected notification snapshots and realtime events", () => {
+    const inbox = notificationInboxWire();
+
+    expect(parseSessionNotificationInboxSnapshot(inbox)).toEqual(inbox);
+    expect(parseSessionNotificationInboxEvent({
+      type: "notifications.inbox",
+      daemonInstanceId: "daemon-a",
+      catalogRevision: 2,
+      summary: { ...inbox.summary, inboxRevision: 2, retainedCount: 2, highestSeverity: "warning" },
+      dismissThrough: { order: 2, overflowWatermark: 0 },
+      delta: { kind: "added", notification: notificationWire(2, "warning") },
+    })).toMatchObject({ type: "notifications.inbox", delta: { kind: "added", notification: { severity: "warning" } } });
+  });
+
+  it("rejects malformed, unsafe, over-cap, and oversized notification payloads", () => {
+    const inbox = notificationInboxWire();
+    expect(() => parseSessionNotificationInboxSnapshot({
+      ...inbox,
+      notifications: [{ ...notificationWire(1), severity: "fatal" }],
+    })).toThrow("Invalid notification severity");
+    expect(() => parseSessionNotificationInboxSnapshot({
+      ...inbox,
+      catalogRevision: Number.MAX_SAFE_INTEGER + 1,
+    })).toThrow("safe integer");
+    expect(() => parseSessionNotificationInboxSnapshot({
+      ...inbox,
+      summary: { ...inbox.summary, retainedCount: SESSION_NOTIFICATION_LIMIT },
+      notifications: Array.from({ length: SESSION_NOTIFICATION_LIMIT + 1 }, (_, index) => notificationWire(SESSION_NOTIFICATION_LIMIT + 1 - index)),
+    })).toThrow("exceeds limit");
+    expect(() => parseSessionNotificationInboxSnapshot({
+      ...inbox,
+      notifications: [{ ...notificationWire(1), message: "x".repeat(SESSION_NOTIFICATION_MESSAGE_BYTES + 1) }],
+    })).toThrow("message exceeds byte limit");
+    expect(() => parseSessionNotificationInboxEvent({
+      type: "notifications.inbox",
+      daemonInstanceId: "daemon-a",
+      catalogRevision: 2,
+      summary: { ...inbox.summary, inboxRevision: 2 },
+      dismissThrough: { order: 1, overflowWatermark: 0 },
+      delta: { kind: "cleared", reason: "future-reason" },
+    })).toThrow("Invalid notification clear reason");
+  });
 });
+
+function sessionTreeWire() {
+  const kinds = [
+    "user",
+    "assistant",
+    "tool-result",
+    "bash",
+    "custom-message",
+    "compaction",
+    "branch-summary",
+    "model-change",
+    "thinking-level-change",
+    "session-info",
+    "label",
+    "custom",
+    "other",
+  ] as const;
+  const nodes = kinds.map((kind, index) => ({
+    id: `entry-${String(index)}`,
+    parentId: index === 0 ? null : `entry-${String(index - 1)}`,
+    kind,
+    summary: `${kind} summary`,
+    ...(index === 0 ? { timestamp: "2026-07-20T00:00:00.000Z", label: "root label" } : {}),
+  }));
+  return {
+    nodes,
+    activeLeafId: nodes.at(-1)?.id ?? null,
+    activePathIds: nodes.map((node) => node.id),
+  };
+}
+
+function notificationWire(order: number, severity: "info" | "warning" | "error" = "info") {
+  return {
+    id: `daemon-a:${String(order)}`,
+    message: `notice ${String(order)}`,
+    truncated: false,
+    severity,
+    receivedAt: "2026-07-18T00:00:00.000Z",
+    order,
+  };
+}
+
+function notificationInboxWire() {
+  return {
+    daemonInstanceId: "daemon-a",
+    catalogRevision: 1,
+    summary: {
+      sessionId: "session-1",
+      cwd: "/repo",
+      inboxRevision: 1,
+      retainedCount: 1,
+      discardedCount: 0,
+      highestSeverity: "info" as const,
+    },
+    notifications: [notificationWire(1)],
+    dismissThrough: { order: 1, overflowWatermark: 0 },
+  };
+}

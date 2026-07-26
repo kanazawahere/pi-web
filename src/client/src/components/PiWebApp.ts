@@ -1,6 +1,6 @@
 import { LitElement, html } from "lit";
 import { customElement, query, state } from "lit/decorators.js";
-import { configApi, effectiveWorkspaceUploadFolder, secureInputApi, sessionsApi, terminalsApi, workspacesApi, workspaceEffectiveUploadFolder, type Machine, type MachineHealth, type PiWebConfigValues, type PiWebShortcutConfig, type Project, type RealtimeEvent, type SecureInputStatusResponse, type SessionCleanupExecuteResponse, type SessionCleanupPreviewResponse, type SessionCleanupRequest, type SessionInfo, type TerminalCommandRun, type TerminalUiEvent, type Workspace } from "../api";
+import { configApi, effectiveWorkspaceUploadFolder, secureInputApi, sessionsApi, terminalsApi, workspacesApi, workspaceEffectiveUploadFolder, type Machine, type MachineHealth, type PiWebConfigValues, type PiWebShortcutConfig, type Project, type RealtimeEvent, type SecureInputStatusResponse, type SessionCleanupExecuteResponse, type SessionCleanupPreviewResponse, type SessionCleanupRequest, type SessionInfo, type SessionTreeNavigateResult, type SessionTreeSummaryChoice, type TerminalCommandRun, type TerminalUiEvent, type Workspace } from "../api";
 import type { AppAction } from "../actions";
 import { initialAppState, type AppState } from "../appState";
 import { isSessionActive } from "../../../shared/activity";
@@ -11,8 +11,10 @@ import { FileExplorerController } from "../controllers/fileExplorerController";
 import { GitController } from "../controllers/gitController";
 import { MachineController } from "../controllers/machineController";
 import { ProjectController } from "../controllers/projectController";
+import { ProjectActivityOwnershipCoordinator } from "../controllers/projectActivityOwnershipCoordinator";
 import { PiWebStatusController } from "../controllers/piWebStatusController";
 import { SessionController } from "../controllers/sessionController";
+import { SessionNotificationController } from "../controllers/sessionNotificationController";
 import { WorkspaceController, canDeleteWorkspace } from "../controllers/workspaceController";
 import { emptyMachineNavigationSnapshot, machineNavigationSnapshotFromState, routeFromMachineNavigationSnapshot, SessionStorageMachineNavigationMemory, type MachineNavigationSnapshot, type WorkspaceRouteSurface } from "../controllers/machineNavigationMemory";
 import { SessionStorageSessionSelectionMemory } from "../controllers/sessionSelection";
@@ -20,9 +22,13 @@ import { SessionStorageTerminalSelectionMemory } from "../controllers/terminalSe
 import { SessionStorageWorkspaceSelectionMemory } from "../controllers/workspaceSelection";
 import { KeyboardShortcutDispatcher } from "../keyboardShortcuts";
 import { selectedMachineId } from "../controllers/types";
+import { machineSessionKey } from "../machineKeys";
 import { sessionCleanupRequestKey, sessionCleanupUnavailableMessage } from "../sessionCleanupUi";
+import { selectedNotificationView } from "../sessionNotifications";
 import { hasAuthoritativeSessionPersistence as runtimeHasAuthoritativeSessionPersistence } from "../sessionPersistence";
-import { RealtimeSocket } from "../sessionSocket";
+import { SessionUnreadController } from "../sessionUnread";
+import { initialSessionWarningVisibilityState, reconcileSessionWarningVisibility, toggleSessionWarnings } from "../sessionWarningVisibility";
+import { RealtimeSocket, type BrowserRealtimeEvent } from "../sessionSocket";
 import type { PiWebPluginRegistration, PluginMachine, PluginPromptEditor, QualifiedContributionId, QualifiedThemeContribution, QualifiedThemePairContribution, QualifiedWorkspacePanelContribution, PluginRuntimeContext, TerminalCommandRunsInternalRuntime, WorkspaceFiles, WorkspaceHost, WorkspaceLabelContext, WorkspaceLabelItem, WorkspacePanelContext } from "../plugins/types";
 import { CLASSIC_THEME_ID, DEFAULT_THEME_PREFERENCE, applyPiWebTheme, findThemePairForTheme, readStoredThemePreference, resolveThemePreference, writeStoredThemePreference, type ThemePreference, type ThemePreferenceResolution } from "../theme";
 import { corePlugin } from "../plugins/core";
@@ -43,9 +49,10 @@ import { isWorkspaceDeletionPending, isWorkspaceDeletionRunPending, latestWorksp
 import "./MachineList";
 import "./ProjectList";
 import "./WorkspaceList";
-import "./SessionList";
+import { unreadSessionCount } from "./SessionList";
 import "./SessionCleanupDialog";
 import "./SecureInputDialog";
+import "./SessionTreeNavigator";
 import "./ChatView";
 import type { ChatView } from "./ChatView";
 import "./PromptEditor";
@@ -101,15 +108,57 @@ export class PiWebApp extends LitElement {
   @query("#navigation-panel") private navigationPanelFrame?: HTMLElement;
   @query("#workspace-panel") private workspacePanelFrame?: HTMLElement;
 
+  private readonly sessionUnread = new SessionUnreadController({
+    onChange: (machineId) => {
+      if (selectedMachineId(this.state) !== machineId) return;
+      this.syncUnreadSessionIds();
+      this.syncSelectedSessionReadState();
+    },
+    onBackgroundError: (operation, machineId, error) => {
+      console.warn(`Failed to ${operation} session unread state for ${machineId}`, error);
+    },
+  });
+  @state() private unreadSessionIds: ReadonlySet<string> = this.sessionUnread.unreadSessionIds(selectedMachineId(this.state), this.state.sessions);
+  private unreadConnected = false;
+  private committedChatIdentity: string | undefined;
+  private readyChatIdentity: string | undefined;
+
+  private readonly notifications = new SessionNotificationController(
+    () => this.state,
+    (patch) => { this.setState(patch); },
+    { onBackgroundError: (message, error) => { console.warn(message, error); } },
+  );
   private readonly sessions = new SessionController(
     () => this.state,
     (patch) => { this.setState(patch); },
     () => { this.updateUrl(); },
     new SessionStorageSessionSelectionMemory(),
+    {
+      notifications: this.notifications,
+      onSelectedSessionReady: ({ machineId, session }) => {
+        void this.commitReadyChatAfterRender(machineId, session);
+      },
+      replacePromptEditorText: async ({ machineId, sessionId, text }) => {
+        await this.updateComplete;
+        if (selectedMachineId(this.state) !== machineId || this.state.selectedSession?.id !== sessionId) return;
+        this.promptEditor?.replaceText(text);
+      },
+    },
+  );
+  private readonly projectActivityOwnership = new ProjectActivityOwnershipCoordinator(
+    () => this.state,
+    (patch) => { this.setState(patch); },
+    {
+      api: workspacesApi,
+      onError: ({ machineId, projectId, error }) => {
+        console.warn(`Failed to discover project activity ownership for ${projectId} on ${machineId}`, error);
+      },
+    },
   );
   private readonly activity = new ActivityController(
     () => this.state,
     (patch) => { this.setState(patch); },
+    { onActivityApplied: (machineId) => { void this.projectActivityOwnership.handleActivityApplied(machineId); } },
   );
   private readonly auth = new AuthController(
     () => this.state,
@@ -127,6 +176,7 @@ export class PiWebApp extends LitElement {
     () => this.state,
     (patch) => { this.setState(patch); },
     this.workspaces,
+    { onProjectsApplied: (machineId) => { void this.projectActivityOwnership.handleProjectsApplied(machineId); } },
   );
   private readonly machines = new MachineController(
     () => this.state,
@@ -151,7 +201,8 @@ export class PiWebApp extends LitElement {
   );
   private readonly keyboard = new KeyboardShortcutDispatcher();
   private readonly realtime = new RealtimeSocket();
-  private readonly machineActivitySockets = new Map<string, RealtimeSocket>();
+  private readonly machineRealtimeSockets = new Map<string, RealtimeSocket>();
+  private readonly unreadRuntimeRefreshes = new Map<string, Promise<void>>();
   private readonly activeTerminalIds = new Set<string>();
   private readonly machineNavigation = new SessionStorageMachineNavigationMemory();
   private readonly terminalSelection = new SessionStorageTerminalSelectionMemory();
@@ -198,11 +249,13 @@ export class PiWebApp extends LitElement {
   @state() private secureInputDialogOpen = false;
   @state() private shortcutConfig: PiWebShortcutConfig = {};
   @state() private workspaceUploadDefaultFolder = effectiveWorkspaceUploadFolder(undefined);
+  private sessionWarningVisibility = initialSessionWarningVisibilityState();
   private readonly onPopState = () => void this.withChatScrollTransition(async () => {
     this.restoreSettingsRoute();
     await this.restoreRoute(false);
   });
   private readonly onPageShow = () => {
+    void this.renegotiateUnreadMachines();
     this.appShell.repairViewportPosition();
     this.retryPendingRemoteRouteRestoreSoon();
   };
@@ -214,7 +267,7 @@ export class PiWebApp extends LitElement {
   }
 
   private readonly onKeyDown = (event: KeyboardEvent) => {
-    if (this.settingsSection !== undefined) return;
+    if (this.settingsSection !== undefined || this.state.treeDialog !== undefined) return;
     if (this.keyboard.handle(event, this.getDefaultActions(), { shortcuts: this.shortcutConfig })) {
       event.preventDefault();
       event.stopPropagation();
@@ -223,10 +276,80 @@ export class PiWebApp extends LitElement {
 
   protected override willUpdate(): void {
     this.toggleAttribute("pwa-display-mode", this.appShell.isPwaDisplayMode);
+    this.syncSessionWarningVisibility();
+  }
+
+  protected override updated(): void {
+    // Lit has now committed the selected chat and app-shell visibility state.
+    // Recheck after every rendered transition; the unread controller
+    // deduplicates acknowledgements for the observed completion order.
+    this.committedChatIdentity = selectedChatIdentity(this.state);
+    this.syncSelectedSessionReadState();
+  }
+
+  private syncSessionWarningVisibility(): void {
+    const session = this.state.selectedSession;
+    this.sessionWarningVisibility = reconcileSessionWarningVisibility(
+      this.sessionWarningVisibility,
+      session === undefined ? undefined : machineSessionKey(selectedMachineId(this.state), session.id),
+      this.state.status === undefined ? undefined : this.state.status.warnings ?? [],
+    );
+  }
+
+  private syncSelectedSessionReadState(): void {
+    const session = this.state.selectedSession;
+    if (session === undefined) return;
+    const machineId = selectedMachineId(this.state);
+    if (!this.isSessionSeen(machineId, session)) return;
+    void this.sessionUnread.acknowledge(machineId, session);
+  }
+
+  private async commitReadyChatAfterRender(machineId: string, session: SessionInfo): Promise<void> {
+    const identity = unreadChatIdentity(machineId, session);
+    await this.updateComplete;
+    if (!this.unreadConnected || selectedChatIdentity(this.state) !== identity) return;
+    this.readyChatIdentity = identity;
+    this.syncSelectedSessionReadState();
+  }
+
+  private syncUnreadSessionIds(): void {
+    const next = this.sessionUnread.unreadSessionIds(selectedMachineId(this.state), this.state.sessions);
+    if (!sameStringSet(next, this.unreadSessionIds)) this.unreadSessionIds = next;
+  }
+
+  private isSessionSeen(machineId: string, session: SessionInfo): boolean {
+    if (!this.unreadConnected) return false;
+    const identity = unreadChatIdentity(machineId, session);
+    if (selectedChatIdentity(this.state) !== identity
+      || this.committedChatIdentity !== identity
+      || this.readyChatIdentity !== identity) return false;
+    if (typeof document !== "undefined") {
+      if (document.visibilityState !== "visible") return false;
+      if (typeof document.hasFocus === "function" && !document.hasFocus()) return false;
+    }
+    if (this.isChatObscured()) return false;
+    if (this.state.mainView === "chat") return true;
+    if (this.state.mainView === "navigation") return !this.appShell.isMobileNavigationLayout;
+    return this.isDesktopSideBySideLayout();
+  }
+
+  private isChatObscured(): boolean {
+    return this.settingsSection !== undefined
+      || this.sessionCleanupDialog !== undefined
+      || this.state.actionPaletteOpen
+      || this.state.projectDialogOpen
+      || this.state.machineDialogOpen
+      || this.state.commandDialog !== undefined
+      || this.state.treeDialog !== undefined
+      || this.state.modelDialog !== undefined
+      || this.state.thinkingDialog !== undefined
+      || this.state.themeDialog !== undefined
+      || this.state.authDialog !== undefined;
   }
 
   override connectedCallback(): void {
     super.connectedCallback();
+    this.unreadConnected = true;
     window.addEventListener("popstate", this.onPopState);
     window.addEventListener("pageshow", this.onPageShow);
     this.browserResume.connect();
@@ -234,6 +357,7 @@ export class PiWebApp extends LitElement {
     this.systemLightThemeMedia?.addEventListener("change", this.onSystemLightThemeChange);
     this.applyPreferredTheme(false);
     this.connectRealtime();
+    void this.renegotiateUnreadMachines();
     this.piWebStatusTimer = window.setInterval(() => { this.schedulePiWebStatusRefresh(); }, PI_WEB_STATUS_REFRESH_MS);
     void this.refreshWorkspaceActivity();
     void this.loadClientConfig();
@@ -243,6 +367,11 @@ export class PiWebApp extends LitElement {
   }
 
   override disconnectedCallback(): void {
+    this.unreadConnected = false;
+    this.committedChatIdentity = undefined;
+    this.readyChatIdentity = undefined;
+    this.unreadRuntimeRefreshes.clear();
+    this.sessionUnread.retainMachines(new Set<string>());
     window.removeEventListener("popstate", this.onPopState);
     window.removeEventListener("pageshow", this.onPageShow);
     this.browserResume.disconnect();
@@ -251,6 +380,7 @@ export class PiWebApp extends LitElement {
     this.keyboard.reset();
     this.auth.dispose();
     this.sessions.dispose();
+    this.notifications.dispose();
     this.realtime.close();
     this.closeMachineActivitySockets();
     this.git.dispose();
@@ -267,10 +397,17 @@ export class PiWebApp extends LitElement {
     if (!patchChangesState(this.state, patch)) return;
     const previous = this.state;
     this.state = { ...this.state, ...patch };
+    if (selectedChatIdentity(previous) !== selectedChatIdentity(this.state)) {
+      this.committedChatIdentity = undefined;
+      this.readyChatIdentity = undefined;
+    }
+    if (machineUnreadInputsChanged(previous, this.state)) this.syncSessionUnreadMachines();
+    this.syncUnreadSessionIds();
     this.handleActivityTransition(previous, this.state);
     this.handleWorkspaceChange(previous, this.state);
     this.handleMachineChange(previous, this.state);
     if (machineActivitySubscriptionInputsChanged(previous, this.state)) this.syncMachineActivitySubscriptions();
+    this.notifications.syncEnvironment(previous, this.state);
   }
 
   private async loadProjectsAndRestoreRoute() {
@@ -297,6 +434,7 @@ export class PiWebApp extends LitElement {
   }
 
   private async refreshAfterBrowserResume(): Promise<void> {
+    await this.renegotiateUnreadMachines();
     await Promise.all([
       this.sessions.refreshSelectedSession(),
       this.refreshMachineActivities(),
@@ -795,40 +933,91 @@ export class PiWebApp extends LitElement {
     this.git.updatePolling();
   }
 
+  private syncSessionUnreadMachines(): void {
+    if (!this.unreadConnected) {
+      this.sessionUnread.retainMachines(new Set<string>());
+      return;
+    }
+    const machineIds = new Set(this.state.machines.map((machine) => machine.id));
+    this.sessionUnread.retainMachines(machineIds);
+    for (const machineId of machineIds) {
+      const runtime = this.state.machineRuntimes[machineId];
+      if (runtime === undefined) continue;
+      const capability = this.unreadRuntimeRefreshes.has(machineId) || !runtime.ok
+        ? "unknown"
+        : supportsPiWebCapability(runtime, PI_WEB_CAPABILITIES.sessionsUnread)
+          ? "supported"
+          : "unsupported";
+      if (this.sessionUnread.setCapability(machineId, capability)) void this.sessionUnread.refresh(machineId);
+    }
+  }
+
+  private async renegotiateUnreadMachines(): Promise<void> {
+    if (!this.unreadConnected) return;
+    const machineIds = new Set(this.state.machines.map((machine) => machine.id));
+    machineIds.add(selectedMachineId(this.state));
+    await Promise.all([...machineIds].map(async (machineId) => { await this.renegotiateUnreadMachine(machineId); }));
+  }
+
+  private renegotiateUnreadMachine(machineId: string): Promise<void> {
+    const existing = this.unreadRuntimeRefreshes.get(machineId);
+    if (existing !== undefined) return existing;
+    this.sessionUnread.setCapability(machineId, "unknown");
+    let refreshed = false;
+    const refresh = Promise.resolve().then(async () => {
+      refreshed = await this.machines.refreshMachineRuntime(machineId) !== undefined;
+    });
+    this.unreadRuntimeRefreshes.set(machineId, refresh);
+    const finishRefresh = () => {
+      if (this.unreadRuntimeRefreshes.get(machineId) !== refresh) return;
+      this.unreadRuntimeRefreshes.delete(machineId);
+      if (!this.unreadConnected) return;
+      if (refreshed) this.syncSessionUnreadMachines();
+      else this.sessionUnread.setCapability(machineId, "unknown");
+    };
+    void refresh.then(finishRefresh, finishRefresh);
+    return refresh;
+  }
+
   private connectRealtime(): void {
+    const machineId = selectedMachineId(this.state);
     this.realtime.connect(
-      (event) => { this.handleRealtimeEvent(event); },
+      (event) => { this.handleRealtimeEvent(machineId, event); },
       () => {
+        void this.renegotiateUnreadMachine(machineId);
         const workspace = this.state.selectedWorkspace;
         if (workspace !== undefined) void this.refreshActiveTerminals(workspace);
-        void this.refreshWorkspaceActivity();
+        void this.refreshWorkspaceActivity(machineId);
       },
-      selectedMachineId(this.state),
+      machineId,
     );
   }
 
   private syncMachineActivitySubscriptions(): void {
     const desiredMachineIds = this.machineActivitySubscriptionIds();
-    for (const [machineId, socket] of this.machineActivitySockets.entries()) {
+    for (const [machineId, socket] of this.machineRealtimeSockets.entries()) {
       if (desiredMachineIds.has(machineId)) continue;
       socket.close();
-      this.machineActivitySockets.delete(machineId);
+      this.machineRealtimeSockets.delete(machineId);
     }
     for (const machineId of desiredMachineIds) {
-      if (this.machineActivitySockets.has(machineId)) continue;
+      if (this.machineRealtimeSockets.has(machineId)) continue;
       const socket = new RealtimeSocket();
       socket.connect(
         (event) => { this.handleMachineActivityEvent(machineId, event); },
-        () => { void this.refreshWorkspaceActivity(machineId); },
+        () => {
+          void this.renegotiateUnreadMachine(machineId);
+          void this.refreshWorkspaceActivity(machineId);
+        },
         machineId,
       );
-      this.machineActivitySockets.set(machineId, socket);
+      this.machineRealtimeSockets.set(machineId, socket);
     }
   }
 
   private closeMachineActivitySockets(): void {
-    for (const socket of this.machineActivitySockets.values()) socket.close();
-    this.machineActivitySockets.clear();
+    for (const socket of this.machineRealtimeSockets.values()) socket.close();
+    this.machineRealtimeSockets.clear();
   }
 
   private machineActivitySubscriptionIds(): Set<string> {
@@ -839,12 +1028,14 @@ export class PiWebApp extends LitElement {
       .map((machine) => machine.id));
   }
 
-  private handleMachineActivityEvent(machineId: string, event: RealtimeEvent): void {
-    if (event.type === "workspace.activity") this.activity.applyWorkspaceActivity(event.activity, machineId);
+  private handleMachineActivityEvent(machineId: string, event: BrowserRealtimeEvent): void {
+    if (event.type === "sessions.unread") this.sessionUnread.applyEvent(machineId, event);
+    else if (event.type === "workspace.activity") this.activity.applyWorkspaceActivity(event.activity, machineId);
   }
 
-  private handleRealtimeEvent(event: RealtimeEvent): void {
-    if (event.type === "workspace.activity") this.activity.applyWorkspaceActivity(event.activity);
+  private handleRealtimeEvent(machineId: string, event: BrowserRealtimeEvent): void {
+    if (event.type === "sessions.unread") this.sessionUnread.applyEvent(machineId, event);
+    else if (event.type === "workspace.activity") this.activity.applyWorkspaceActivity(event.activity);
     else if (isTerminalEvent(event)) {
       this.applyTerminalEvent(event);
       if (event.type === "terminal.exited") void this.refreshWorkspaceDeletionRuns();
@@ -891,6 +1082,7 @@ export class PiWebApp extends LitElement {
 
   private handleMachineChange(previous: AppState, next: AppState): void {
     if ((previous.selectedMachine?.id ?? "local") === (next.selectedMachine?.id ?? "local")) return;
+    this.projectActivityOwnership.handleSelectedMachineChanged();
     const pendingMachineId = this.pendingRemoteRouteRestore?.machineId ?? "local";
     if (pendingMachineId !== (next.selectedMachine?.id ?? "local")) this.clearPendingRemoteRouteRestore();
     this.sessions.clearActiveSession();
@@ -1140,6 +1332,7 @@ export class PiWebApp extends LitElement {
         .sessionStatuses=${this.state.sessionStatuses}
         .sessionActivities=${this.state.sessionActivities}
         .sendingPrompts=${this.state.sendingPrompts}
+        .unreadSessionIds=${this.unreadSessionIds}
         .selectedSession=${this.state.selectedSession}
         .startingSessionCount=${this.state.startingSessionCount}
         .canStartSession=${!!this.state.selectedWorkspace}
@@ -1246,6 +1439,35 @@ export class PiWebApp extends LitElement {
     await this.updateComplete;
     await nextFrame();
     this.promptEditor?.focusInput();
+  }
+
+  private async navigateSessionTree(targetId: string, summaryChoice: SessionTreeSummaryChoice): Promise<SessionTreeNavigateResult> {
+    const originMachineId = selectedMachineId(this.state);
+    const originSessionId = this.state.selectedSession?.id;
+    const result = await this.sessions.navigateTree(targetId, summaryChoice);
+    if (!result.cancelled
+      && originSessionId !== undefined
+      && selectedMachineId(this.state) === originMachineId
+      && this.state.selectedSession?.id === originSessionId) {
+      await this.focusChatComposer();
+    }
+    return result;
+  }
+
+  private closeSessionTreeNavigator(): void {
+    this.sessions.closeTreeDialog();
+    void this.focusChatComposer();
+  }
+
+  private renderSessionTreeNavigator(state: AppState) {
+    return state.treeDialog === undefined ? null : html`
+      <session-tree-navigator
+        .tree=${state.treeDialog}
+        .onNavigate=${(targetId: string, summaryChoice: SessionTreeSummaryChoice) => this.navigateSessionTree(targetId, summaryChoice)}
+        .onAbort=${() => this.sessions.abortTreeNavigation()}
+        .onCancel=${() => { this.closeSessionTreeNavigator(); }}
+      ></session-tree-navigator>
+    `;
   }
 
   private visibleWorkspacePanels(): QualifiedWorkspacePanelContribution[] {
@@ -1903,6 +2125,25 @@ export class PiWebApp extends LitElement {
     void this.sessions.clearServerQueue();
   };
 
+  private readonly handleDismissWarning = (dismissId: string): void => {
+    void this.sessions.dismissWarning(dismissId);
+  };
+
+  private readonly handleDismissNotification = (notificationId: string): void => {
+    void this.notifications.dismissNotification(notificationId);
+  };
+
+  private readonly handleDismissAllNotifications = (): void => {
+    void this.notifications.dismissAll();
+  };
+
+  private readonly handleToggleWarnings = (): void => {
+    const next = toggleSessionWarnings(this.sessionWarningVisibility);
+    if (next === this.sessionWarningVisibility) return;
+    this.sessionWarningVisibility = next;
+    this.requestUpdate();
+  };
+
   private readonly handleSelectModel = (): void => {
     void this.openModelDialog();
   };
@@ -1913,7 +2154,14 @@ export class PiWebApp extends LitElement {
 
   private renderChatView(state: AppState, session: SessionInfo) {
     return html`
-      <chat-view .sessionId=${session.id} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isReceivingPartialStream=${state.isReceivingPartialStream} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? []} .status=${state.status} .activity=${state.activity} .canClearServerQueue=${this.canClearServerQueue()} .onClearServerQueue=${this.handleClearServerQueue} .onLoadMore=${() => this.withChatPrependTransition(() => this.sessions.loadEarlierMessages())}></chat-view>
+      <chat-view .sessionId=${session.id} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? []} .status=${state.status} .activity=${state.activity} .notificationInbox=${selectedNotificationView(state.selectedNotificationInbox)} .canClearServerQueue=${this.canClearServerQueue()} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${() => this.withChatPrependTransition(() => this.sessions.loadEarlierMessages())}></chat-view>
+    `;
+  }
+
+  private renderStatusBar(state: AppState) {
+    const warningCount = this.sessionWarningVisibility.warningCount;
+    return html`
+      <status-bar .status=${state.status} .warningCount=${warningCount} .warningsExpanded=${warningCount > 0 && !this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings}></status-bar>
     `;
   }
 
@@ -1950,8 +2198,19 @@ export class PiWebApp extends LitElement {
   }
 
   private mobileMainTabs(): AppMobileMainTab[] {
+    const unreadCount = unreadSessionCount(this.state.sessions, this.unreadSessionIds, {
+      statuses: this.state.sessionStatuses,
+      activities: this.state.sessionActivities,
+      sending: this.state.sendingPrompts,
+    });
     return [
-      { id: "navigation", label: "Sessions", icon: "navigation", className: "navigation-tab" },
+      {
+        id: "navigation",
+        label: "Sessions",
+        icon: "navigation",
+        className: "navigation-tab",
+        ...(unreadCount === 0 ? {} : { badge: unreadCount, badgeLabel: `${String(unreadCount)} unread`, badgeTone: "unread" }),
+      },
       { id: "chat", label: "Chat", icon: "chat" },
       ...this.visibleWorkspacePanels().map((panel): AppMobileMainTab => {
         const icon = panel.icon ?? this.mobilePanelIcon(panel);
@@ -1983,7 +2242,7 @@ export class PiWebApp extends LitElement {
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}
             <prompt-editor .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .workspaceScopedFileSuggestions=${this.supportsWorkspaceFileSuggestions()} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
-            <status-bar .status=${state.status}></status-bar>
+            ${this.renderStatusBar(state)}
             ${state.commandDialog !== undefined ? html`<command-picker .title=${state.commandDialog.title} .options=${state.commandDialog.options} .onPick=${(value: string) => this.sessions.respondToCommand(state.commandDialog?.requestId ?? "", value)} .onCancel=${() => { this.sessions.cancelCommand(); }}></command-picker>` : null}
             ${state.modelDialog !== undefined ? html`<command-picker title=${state.modelDialog.title} .searchable=${true} .options=${state.modelDialog.options} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></command-picker>` : null}
             ${state.thinkingDialog !== undefined ? html`<command-picker title=${state.thinkingDialog.title} .options=${state.thinkingDialog.options} .selectedValue=${state.thinkingDialog.selectedValue} .onPick=${(value: string) => { void this.pickThinking(value); }} .onCancel=${() => { this.setState({ thinkingDialog: undefined }); }}></command-picker>` : null}
@@ -1993,12 +2252,13 @@ export class PiWebApp extends LitElement {
         ${this.renderWorkspacePanelEdgeControl()}
         ${this.renderWorkspacePanel()}
         ${state.actionPaletteOpen ? html`<action-palette .actions=${this.getActions()} .onRun=${(action: AppAction) => { this.setState({ actionPaletteOpen: false }); this.runAction(action); }} .onCancel=${() => { this.setState({ actionPaletteOpen: false }); }}></action-palette>` : null}
+        ${this.renderSessionTreeNavigator(state)}
         ${state.projectDialogOpen ? html`<project-dialog .machineId=${selectedMachineId(state)} .onSubmit=${(path: string, create: boolean) => this.projects.addProject(path, create)} .onCancel=${() => { this.setState({ projectDialogOpen: false }); }}></project-dialog>` : null}
         ${state.machineDialogOpen ? html`<machine-dialog .error=${state.error} .onSubmit=${(input: MachineDialogSubmit) => this.submitMachineDialog(input)} .onCancel=${() => { this.setState({ machineDialogOpen: false }); }}></machine-dialog>` : null}
         ${this.secureInputDialogOpen ? html`<secure-input-dialog .label=${this.secureInputStatus.label ?? "Secret"} .maxBytes=${this.secureInputStatus.maxBytes ?? 4096} .onClose=${() => { this.secureInputDialogOpen = false; }}></secure-input-dialog>` : null}
         ${this.sessionCleanupDialog !== undefined ? html`<session-cleanup-dialog .canCleanup=${this.canCleanupSessions()} .unavailableMessage=${this.sessionCleanupUnavailableMessage()} .preview=${this.sessionCleanupDialog.preview} .previewRequest=${this.sessionCleanupDialog.previewRequest} .result=${this.sessionCleanupDialog.result} .loading=${this.sessionCleanupDialog.loading === true} .running=${this.sessionCleanupDialog.running === true} .error=${this.sessionCleanupDialog.error ?? ""} .onPreview=${(request: SessionCleanupRequest) => { void this.previewSessionCleanup(request); }} .onRun=${(request: SessionCleanupRequest) => { void this.runSessionCleanup(request); }} .onClose=${() => { this.closeSessionCleanupDialog(); }}></session-cleanup-dialog>` : null}
         ${state.themeDialog !== undefined ? html`<command-picker title=${state.themeDialog.title} .options=${state.themeDialog.options} .selectedValue=${state.themeDialog.selectedValue} .onPick=${(value: string) => { this.pickTheme(value); }} .onCancel=${() => { this.setState({ themeDialog: undefined }); }}></command-picker>` : null}
-        ${this.settingsSection !== undefined ? html`<settings-dialog .section=${this.settingsSection} .machine=${state.selectedMachine} .machineRuntime=${this.selectedMachineRuntime()} .actions=${this.getDefaultActions()} .onNavigate=${(section: SettingsSection) => { this.navigateSettings(section); }} .onClose=${() => { this.closeSettings(); }} .onConfigSaved=${(config: PiWebConfigValues) => { this.applyClientConfig(config); }} .onRefreshMachineRuntime=${(machineId: string) => this.machines.refreshMachineRuntime(machineId)}></settings-dialog>` : null}
+        ${this.settingsSection !== undefined ? html`<settings-dialog .section=${this.settingsSection} .machine=${state.selectedMachine} .machineRuntime=${this.selectedMachineRuntime()} .actions=${this.getDefaultActions()} .onNavigate=${(section: SettingsSection) => { this.navigateSettings(section); }} .onClose=${() => { this.closeSettings(); }} .onConfigSaved=${(config: PiWebConfigValues) => { this.applyClientConfig(config); }} .onRefreshMachineRuntime=${async (machineId: string) => { await this.machines.refreshMachineRuntime(machineId); }}></settings-dialog>` : null}
       </div>
     `;
   }
@@ -2017,6 +2277,19 @@ function pluginMachineFromState(state: Pick<AppState, "selectedMachine">): Plugi
   const machine = state.selectedMachine;
   if (machine !== undefined) return { id: machine.id, name: machine.name, kind: machine.kind };
   return { id: "local", name: "local", kind: "local" };
+}
+
+function unreadChatIdentity(machineId: string, session: Pick<SessionInfo, "id" | "cwd">): string {
+  return JSON.stringify([machineId, session.id, session.cwd]);
+}
+
+function selectedChatIdentity(state: Pick<AppState, "selectedMachine" | "selectedSession">): string | undefined {
+  const session = state.selectedSession;
+  return session === undefined ? undefined : unreadChatIdentity(selectedMachineId(state), session);
+}
+
+function machineUnreadInputsChanged(previous: AppState, next: AppState): boolean {
+  return previous.machines !== next.machines || previous.machineRuntimes !== next.machineRuntimes;
 }
 
 function machineActivitySubscriptionInputsChanged(previous: AppState, next: AppState): boolean {
@@ -2039,11 +2312,15 @@ function patchChangesState(state: AppState, patch: Partial<AppState>): boolean {
   return Object.entries(patch).some(([key, value]) => Reflect.get(state, key) !== value);
 }
 
+function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
+}
+
 function isActive(state: Pick<AppState, "status" | "activity">): boolean {
   return isSessionActive(state.status, state.activity);
 }
 
-function isTerminalEvent(event: RealtimeEvent): event is TerminalUiEvent {
+function isTerminalEvent(event: BrowserRealtimeEvent): event is TerminalUiEvent {
   return event.type === "terminal.created" || event.type === "terminal.exited" || event.type === "terminal.closed";
 }
 

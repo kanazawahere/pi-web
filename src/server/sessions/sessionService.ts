@@ -3,6 +3,12 @@ import type {
   SessionBulkArchiveResponse,
   SessionBulkDeleteArchivedResponse,
   SessionBulkMutationRef,
+  SessionNotificationCatalogSnapshot,
+  SessionNotificationDismissAllRequest,
+  SessionNotificationDismissRequest,
+  SessionNotificationInboxSnapshot,
+  SessionUnreadAcknowledgeRequest,
+  SessionUnreadCatalogSnapshot,
 } from "../../shared/apiTypes.js";
 import type {
   ClientArchiveSessionsResponse,
@@ -15,7 +21,10 @@ import type {
   ClientSessionModel,
   ClientSessionRef,
   ClientSessionStatus,
+  ClientSessionTreeNavigateRequest,
+  ClientSessionTreeNavigateResult,
   ClientThinkingLevel,
+  SessionStreamSnapshot,
 } from "../types.js";
 import type { NormalizedSessionCleanupRequest } from "./sessionCleanup.js";
 
@@ -34,7 +43,15 @@ export interface SessionRouteService {
   start(cwd: string): Promise<ClientSession>;
   messages(ref: SessionRouteLookup, page?: { before?: number; limit?: number }): Promise<unknown[] | ClientMessagePage>;
   status(ref: SessionRouteLookup): Promise<ClientSessionStatus>;
+  streamSnapshot(ref: SessionRouteLookup): Promise<SessionStreamSnapshot>;
+  notificationCatalog(): SessionNotificationCatalogSnapshot | Promise<SessionNotificationCatalogSnapshot>;
+  unreadCatalog(): Promise<SessionUnreadCatalogSnapshot>;
+  acknowledgeUnread(sessionId: string, request: SessionUnreadAcknowledgeRequest): Promise<SessionUnreadCatalogSnapshot>;
+  notificationInbox(ref: SessionRouteRef): SessionNotificationInboxSnapshot | Promise<SessionNotificationInboxSnapshot>;
+  dismissNotification(ref: SessionRouteRef, request: Omit<SessionNotificationDismissRequest, "cwd">): SessionNotificationInboxSnapshot | Promise<SessionNotificationInboxSnapshot>;
+  dismissAllNotifications(ref: SessionRouteRef, request: Omit<SessionNotificationDismissAllRequest, "cwd">): SessionNotificationInboxSnapshot | Promise<SessionNotificationInboxSnapshot>;
   clearQueue(ref: SessionRouteLookup): Promise<ClientSessionStatus>;
+  dismissWarning(ref: SessionRouteLookup, dismissId: string): Promise<ClientSessionStatus>;
   availableModels(ref: SessionRouteLookup): Promise<ClientSessionModel[]>;
   setModel(ref: SessionRouteLookup, provider: string, modelId: string): Promise<ClientSessionStatus>;
   cycleModel(ref: SessionRouteLookup, direction: "forward" | "backward"): Promise<ClientSessionStatus>;
@@ -51,6 +68,7 @@ export interface SessionRouteService {
   shell(ref: SessionRouteLookup, text: string): Promise<void>;
   runCommand(ref: SessionRouteLookup, text: string): Promise<ClientCommandResult>;
   respondToCommand(ref: SessionRouteLookup, requestId: string, value: string): Promise<ClientCommandResult>;
+  navigateTree(ref: SessionRouteLookup, request: ClientSessionTreeNavigateRequest): Promise<ClientSessionTreeNavigateResult>;
   abort(ref: SessionRouteLookup): Promise<void>;
   stop(ref: SessionRouteLookup): void | Promise<void>;
   archive(ref: SessionRouteLookup): Promise<void>;

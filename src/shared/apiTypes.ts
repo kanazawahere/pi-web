@@ -8,6 +8,8 @@ export const PI_WEB_CAPABILITIES = {
   sessionsReload: "sessions.reload",
   sessionsClearQueue: "sessions.clearQueue",
   sessionsPersistedState: "sessions.persistedState",
+  sessionsNotifications: "sessions.notifications",
+  sessionsUnread: "sessions.unread",
   promptAttachments: "prompt.attachments",
   workspaceFileSuggestions: "workspace.fileSuggestions",
   piPackagesManage: "piPackages.manage",
@@ -215,6 +217,134 @@ export interface SessionRef {
   cwd: string;
 }
 
+export const SESSION_UNREAD_LIMIT = 1_000;
+export const SESSION_UNREAD_SESSION_ID_MAX_LENGTH = 512;
+export const SESSION_UNREAD_CWD_MAX_LENGTH = 32 * 1024;
+export const SESSION_UNREAD_CATALOG_ID_MAX_LENGTH = 512;
+export const SESSION_UNREAD_COMPLETED_AT_MAX_LENGTH = 64;
+
+export interface SessionUnreadSummary {
+  sessionId: string;
+  cwd: string;
+  /** Monotonic within a catalog and never greater than its containing revision. */
+  completionOrder: number;
+  completedAt: string;
+}
+
+export interface SessionUnreadCatalogSnapshot {
+  /** Stable for one persisted catalog epoch; changes when unread state is reset. */
+  catalogId: string;
+  /** Monotonic catalog mutation revision; at least every contained completion order. */
+  catalogRevision: number;
+  /** Bounded by `SESSION_UNREAD_LIMIT` and ordered newest completion first. */
+  sessions: SessionUnreadSummary[];
+}
+
+export interface SessionUnreadAcknowledgeRequest {
+  cwd: string;
+  /** The catalog epoch in which `throughCompletionOrder` was observed. */
+  catalogId: string;
+  throughCompletionOrder: number;
+}
+
+/** Authoritative delta for one session in the daemon-owned unread catalog. */
+export interface SessionUnreadEvent {
+  type: "sessions.unread";
+  catalogId: string;
+  /** At least `unread.completionOrder` when carrying an unread summary. */
+  catalogRevision: number;
+  sessionId: string;
+  cwd: string;
+  unread: SessionUnreadSummary | null;
+}
+
+export const SESSION_NOTIFICATION_LIMIT = 100;
+export const SESSION_NOTIFICATION_MESSAGE_BYTES = 8 * 1024;
+
+export type SessionNotificationSeverity = "info" | "warning" | "error";
+
+export interface SessionNotification {
+  id: string;
+  message: string;
+  truncated: boolean;
+  severity: SessionNotificationSeverity;
+  receivedAt: string;
+  order: number;
+}
+
+export interface SessionNotificationSummary {
+  sessionId: string;
+  cwd: string;
+  inboxRevision: number;
+  retainedCount: number;
+  discardedCount: number;
+  highestSeverity?: SessionNotificationSeverity;
+}
+
+export interface SessionNotificationDismissThrough {
+  order: number;
+  overflowWatermark: number;
+}
+
+export interface SessionNotificationInboxSnapshot {
+  daemonInstanceId: string;
+  catalogRevision: number;
+  summary: SessionNotificationSummary;
+  notifications: SessionNotification[];
+  dismissThrough: SessionNotificationDismissThrough;
+}
+
+export interface SessionNotificationCatalogSnapshot {
+  daemonInstanceId: string;
+  catalogRevision: number;
+  sessions: SessionNotificationSummary[];
+}
+
+export interface SessionNotificationDismissRequest {
+  cwd: string;
+  daemonInstanceId: string;
+  notificationId: string;
+}
+
+export interface SessionNotificationDismissAllRequest {
+  cwd: string;
+  daemonInstanceId: string;
+  throughOrder: number;
+  throughOverflowWatermark: number;
+}
+
+export type SessionNotificationClearReason =
+  | "runtime-close"
+  | "archive"
+  | "delete"
+  | "restore"
+  | "archive-reconcile"
+  | "replacement"
+  | "initialization-failed"
+  | "service-dispose";
+
+export type SessionNotificationInboxDelta =
+  | { kind: "added"; notification: SessionNotification; evictedNotificationId?: string }
+  | { kind: "dismissed"; notificationIds: string[] }
+  | { kind: "cleared"; reason: SessionNotificationClearReason }
+  | { kind: "resync" };
+
+export interface SessionNotificationInboxEvent {
+  type: "notifications.inbox";
+  daemonInstanceId: string;
+  catalogRevision: number;
+  summary: SessionNotificationSummary;
+  dismissThrough: SessionNotificationDismissThrough;
+  delta: SessionNotificationInboxDelta;
+}
+
+export interface SessionNotificationSummaryEvent {
+  type: "notifications.summary";
+  daemonInstanceId: string;
+  catalogRevision: number;
+  summary: SessionNotificationSummary;
+}
+
 export interface SessionInfo extends SessionRef {
   path: string;
   /** True when the server has verified a backing session file exists; false when known transient. */
@@ -316,6 +446,26 @@ export interface QueuedSessionMessage {
 }
 
 /**
+ * Progress of the session startup window, where the daemon is still
+ * constructing the agent session and no `PiAgentSession` exists yet, so
+ * `activity.update` cannot be published for it.
+ *
+ * `cwd` is the routing key for a browser row that is still waiting for a
+ * session id: a client-invented pending start knows its workspace path but not
+ * the daemon's session id. `activity.sessionId` carries the daemon's real id, so
+ * the same event also serves the case where the browser already knows it (an
+ * open of an existing session).
+ *
+ * `activity.phase === "idle"` means the startup window ended with nothing left
+ * to report, so a browser that substituted its own text should restore it.
+ */
+export interface SessionStartupProgressEvent {
+  type: "session.startup";
+  cwd: string;
+  activity: SessionActivity;
+}
+
+/**
  * A pi-native image attachment carried with a prompt. The wire format mirrors
  * pi's own `ImageContent` shape (`{ type: "image", data, mimeType }`) so these
  * attachments are compatible with native multimodal delivery after validation.
@@ -385,6 +535,8 @@ export interface AuthProviderOption {
   name: string;
   authType: AuthType;
   status: AuthProviderStatus;
+  /** Additive hint: use the generic AuthInteraction transport instead of the legacy one-secret form. */
+  loginFlow?: "interactive";
 }
 
 export interface AuthProvidersResponse {
@@ -396,10 +548,23 @@ export interface OAuthFlowState {
   providerId: string;
   providerName: string;
   status: "running" | "complete" | "error" | "cancelled";
-  auth?: { url: string; instructions?: string };
-  prompt?: { requestId: string; message: string; placeholder?: string; allowEmpty?: boolean; kind: "prompt" | "manual" };
+  auth?: {
+    url: string;
+    instructions?: string;
+    deviceCode?: { userCode: string; intervalSeconds?: number; expiresInSeconds?: number };
+  };
+  prompt?: {
+    requestId: string;
+    message: string;
+    placeholder?: string;
+    allowEmpty?: boolean;
+    /** Additive semantic detail; legacy peers continue to use `kind`. */
+    promptType?: "text" | "secret" | "manual_code";
+    kind: "prompt" | "manual";
+  };
   select?: { requestId: string; message: string; options: CommandOption[] };
   progress: string[];
+  info?: { message: string; links?: { url: string; label?: string }[] }[];
   error?: string;
 }
 
@@ -409,6 +574,30 @@ export interface ModelSelectionResponse {
 
 export interface ThinkingLevelsResponse {
   levels: string[];
+}
+
+export type SessionWarningSeverity = "info" | "warning" | "error";
+
+/**
+ * A live, runtime-scoped warning surfaced to the browser (skill/resource
+ * diagnostics, extension load errors, subscription-auth billing notice, etc.).
+ *
+ * Warnings are recomputed whenever the runtime is (re)built inside sessiond and
+ * are not persisted chat messages. `source` is an optional short origin label
+ * (e.g. `"skill"`, `"extension"`, `"anthropic"`); `path` carries a related file
+ * path when the warning came from a resource diagnostic.
+ *
+ * `dismiss` is present only when the warning has a durable, first-class
+ * off-switch in the underlying `pi` agent (not a UI-only hide). Its `id` is the
+ * opaque token the server maps back to that suppression; the client renders a
+ * dismiss control for any warning carrying it, without knowing what it means.
+ */
+export interface SessionWarning {
+  severity: SessionWarningSeverity;
+  message: string;
+  source?: string;
+  path?: string;
+  dismiss?: { id: string };
 }
 
 export interface SessionStatus {
@@ -426,6 +615,13 @@ export interface SessionStatus {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   cost: number;
   contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null };
+  /**
+   * Live, runtime-scoped warnings for this session (skill/resource diagnostics,
+   * extension load errors, Anthropic subscription-auth billing notice, etc.).
+   * Recomputed on each status read from the current runtime; absent/empty when
+   * there are none. See {@link SessionWarning}.
+   */
+  warnings?: SessionWarning[];
 }
 
 export interface WorkspaceActivity {
@@ -517,6 +713,10 @@ export interface GitStatusFile {
   oldPath?: string;
   index: GitFileState;
   workingTree: GitFileState;
+  // Set only on a submodule commit-pointer entry (path equals the submodule's
+  // superproject-relative path). Short SHAs of the recorded and current commit.
+  submoduleFromCommit?: string;
+  submoduleToCommit?: string;
 }
 
 export interface GitStatusResponse {
@@ -527,6 +727,11 @@ export interface GitStatusResponse {
   ahead?: number;
   behind?: number;
   files: GitStatusFile[];
+  // Superproject-relative paths of submodules that carry a change. Files inside
+  // a submodule appear in `files` under `<submodule>/<inner path>`; the client
+  // uses this list to group and label them and to distinguish a submodule root
+  // from an ordinary directory with the same name.
+  submodules: string[];
 }
 
 export interface GitDiffResponse {
@@ -695,18 +900,91 @@ export interface CommandOption {
   description?: string;
 }
 
+export type SessionTreeNodeKind =
+  | "user"
+  | "assistant"
+  | "tool-result"
+  | "bash"
+  | "custom-message"
+  | "compaction"
+  | "branch-summary"
+  | "model-change"
+  | "thinking-level-change"
+  | "session-info"
+  | "label"
+  | "custom"
+  | "other";
+
+export interface SessionTreeNode {
+  id: string;
+  parentId: string | null;
+  kind: SessionTreeNodeKind;
+  summary: string;
+  timestamp?: string;
+  label?: string;
+}
+
+export interface SessionTreeSnapshot {
+  /** Pre-order, parent-linked projection of all retained roots and descendants. */
+  nodes: SessionTreeNode[];
+  activeLeafId: string | null;
+  /** Root-to-leaf IDs for explicit, non-color-only active-path rendering. */
+  activePathIds: string[];
+}
+
+export const SESSION_TREE_CUSTOM_INSTRUCTIONS_MAX_LENGTH = 10_000;
+
+export type SessionTreeSummaryChoice =
+  | { mode: "none" }
+  | { mode: "default" }
+  | { mode: "custom"; instructions: string };
+
+export interface SessionTreeNavigateRequest {
+  targetId: string;
+  /** Leaf shown when the navigator opened; null is valid for an empty/root position. */
+  expectedLeafId: string | null;
+  summary: SessionTreeSummaryChoice;
+}
+
+export type SessionTreeNavigateResult =
+  | { cancelled: false; editorText?: string }
+  | { cancelled: true; aborted?: boolean };
+
 export interface MessagePage {
   messages: unknown[];
   start: number;
   total: number;
 }
 
+/**
+ * Join-time snapshot of a session's in-flight assistant stream. `seq` is the
+ * `SessionEventHub` watermark captured together with `partial` in a single tick,
+ * so a joining client can seed `partial` and then apply only buffered live events
+ * with `seq > snapshot.seq` (exactly-once). `partial` is a browser-projected
+ * in-flight `AssistantMessage` (thinking signatures stripped), or `null` when the
+ * session is not mid assistant-message stream.
+ */
+export interface SessionStreamSnapshot {
+  seq: number;
+  /** Browser-projected in-flight `AssistantMessage`, or `null` when idle. */
+  partial: unknown;
+}
+
 export type CommandResult =
   | { type: "done"; message?: string; session?: SessionInfo; promptDraft?: string }
   | { type: "select"; requestId: string; title: string; options: CommandOption[] }
+  | { type: "tree"; tree: SessionTreeSnapshot }
   | { type: "unsupported"; message: string };
 
-export type SessionUiEvent =
+/**
+ * Transport-level per-session sequence stamp. `SessionEventHub.publish` assigns a
+ * monotonic `seq` to every per-session event as it is serialized to the socket.
+ * Clients use it as a watermark against the join-time stream snapshot so buffered
+ * live events are applied exactly once. Existing consumers may ignore it.
+ */
+export type SessionUiEvent = SessionUiEventBody & { seq?: number };
+
+type SessionUiEventBody =
   | { type: "message.append"; message: unknown }
   | { type: "assistant.delta"; text: string }
   | { type: "assistant.thinking.delta"; text: string }
@@ -721,11 +999,16 @@ export type SessionUiEvent =
   | { type: "message.end"; message?: unknown }
   | { type: "status.update"; status: SessionStatus }
   | { type: "activity.update"; activity: SessionActivity }
-  | { type: "command.output"; level: "info" | "success" | "error"; message: string }
+  | { type: "command.output"; level: "info" | "success" | "error"; message: string; notificationId?: string }
+  | SessionNotificationInboxEvent
   | { type: "session.error"; message: string }
   | { type: "session.name"; sessionId: string; name?: string }
   | { type: "session.created"; session: SessionInfo }
   | { type: "pi.event"; eventType: string };
 
-export type GlobalSessionEvent = Extract<SessionUiEvent, { type: "status.update" | "activity.update" | "session.name" | "session.created" }>;
+export type GlobalSessionEvent =
+  | Extract<SessionUiEventBody, { type: "status.update" | "activity.update" | "session.name" | "session.created" }>
+  | SessionNotificationSummaryEvent
+  | SessionUnreadEvent
+  | SessionStartupProgressEvent;
 export type RealtimeEvent = GlobalSessionEvent | TerminalUiEvent | WorkspaceActivityUiEvent;
