@@ -38,6 +38,15 @@ export function renderSteerIcon(): TemplateResult {
   return renderSendIcon();
 }
 
+export function renderUndoIcon(): TemplateResult {
+  return svg`
+    <svg class="prompt-action-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M9 14 4 9l5-5"></path>
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"></path>
+    </svg>
+  `;
+}
+
 export function renderStopIcon(): TemplateResult {
   return svg`
     <svg class="prompt-action-icon prompt-action-icon-filled" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
