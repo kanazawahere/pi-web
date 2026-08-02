@@ -1,4 +1,4 @@
-import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewlineAndIndent, undo } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewlineAndIndent } from "@codemirror/commands";
 import { markdown, deleteMarkupBackward, insertNewlineContinueMarkup } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
 import { EditorView, keymap, placeholder } from "@codemirror/view";
@@ -15,7 +15,7 @@ import { clearDraft, loadDraft, saveDraft } from "../promptDraftStorage";
 import { loadAttachmentDelivery, saveAttachmentDelivery } from "../attachmentPreferences";
 import { createMobilePromptEnterMedia, readPromptEnterPreference, shouldSendPromptOnEnterShortcut, shouldUsePromptEnterShiftShortcut } from "../promptEnterBehavior";
 import { promptEditorStyles, type CompletionItem } from "./shared";
-import { renderAttachIcon, renderSendIcon, renderQueueIcon, renderSteerIcon, renderStopIcon, renderThinkingGauge, renderUndoIcon } from "./promptEditorIcons";
+import { renderAttachIcon, renderSendIcon, renderQueueIcon, renderSteerIcon, renderStopIcon, renderThinkingGauge } from "./promptEditorIcons";
 import { thinkingGauge, thinkingLevelLabel } from "../../../shared/thinkingLevels";
 import "./AutocompleteMenu";
 
@@ -120,7 +120,6 @@ export class PromptEditor extends LitElement {
         </div>
         <div class="actions">
           ${this.renderCompactStatus()}
-          <button class="icon-button undo-button" ?disabled=${busy} title="Undo (recovers text an IME composition just wiped out)" aria-label="Undo" @click=${() => { this.handleUndo(); }}>${renderUndoIcon()}</button>
           <button class="icon-button send-button" ?disabled=${busy} title=${queuesInput ? "Queue until the current activity finishes" : "Send message"} aria-label=${queuesInput ? "Queue message" : "Send message"} @click=${() => { this.send("followUp"); }}>${queuesInput ? renderQueueIcon() : renderSendIcon()}</button>
           ${this.canSteer && !this.isCompacting ? html`<button class="icon-button steer-button" ?disabled=${busy} title="Steer the current response before the next model call" aria-label="Steer current response" @click=${() => { this.send("steer"); }}>${renderSteerIcon()}</button>` : null}
           <button class="icon-button stop-button" ?disabled=${this.disabled || !this.canStop} title=${this.canStop ? "Stop current work and clear queued messages" : "Nothing running"} aria-label="Stop current work" @click=${() => this.onStop?.()}>${renderStopIcon()}</button>
@@ -304,20 +303,6 @@ export class PromptEditor extends LitElement {
         ],
       }),
     });
-  }
-
-  /**
-   * Manual undo button — mainly for mobile IME composition loss (Android voice input
-   * can cancel an in-progress composition and drop uncommitted text; CodeMirror's own
-   * history() records the prior document as an undoable transaction, so this recovers
-   * it without requiring the user to find their keyboard's own undo control).
-   * No-ops safely via CodeMirror's own undo command when there is nothing to undo.
-   */
-  private handleUndo() {
-    const editor = this.editor;
-    if (editor === undefined) return;
-    undo(editor);
-    editor.focus();
   }
 
   private syncEditorDoc() {
