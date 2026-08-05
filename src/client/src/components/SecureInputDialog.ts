@@ -44,6 +44,7 @@ export class SecureInputDialog extends LitElement {
                 <dt>Receipt</dt><dd>${this.receipt.receiptId}</dd>
                 <dt>Accepted</dt><dd>${new Date(this.receipt.acceptedAt).toLocaleString()}</dd>
               </dl>
+              <p class="hint">Tell the agent what this is for, then ask it to check — it reads this once via the <code>/secret-mailbox</code> skill (<code>secret take ${this.receipt.receiptId}</code>), never by echoing the value.</p>
               <div class="actions"><button type="button" class="primary" @click=${() => { this.close(); }}>Close</button></div>
             `}
           </form>
@@ -120,6 +121,8 @@ export class SecureInputDialog extends LitElement {
     .actions button:disabled { opacity: .6; cursor: wait; }
     .error-text { color: var(--pi-danger); }
     .success { color: var(--pi-success); }
+    .hint { color: var(--pi-muted); font-size: 0.9em; }
+    .hint code { background: var(--pi-surface); border-radius: 4px; padding: 1px 4px; }
     dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; margin: 0; }
     dd { margin: 0; overflow-wrap: anywhere; }
   `];
